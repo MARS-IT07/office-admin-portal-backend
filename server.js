@@ -1,6 +1,8 @@
 /**
- * Office Admin Portal — Backend API (Final)
- * Dynamic floors, grocery categories, added_by tracking, bill_url storage
+ * Office Admin Portal — Backend v4
+ * + floor_usage tracking (month-end stock count)
+ * + carry_forward (opening stock next month)
+ * + validations: no negative, assigned <= purchased
  */
 
 const express = require('express');
@@ -11,7 +13,7 @@ require('dotenv').config();
 const app = express();
 app.use(express.json());
 app.use(cors({
-  origin: '*',
+  origin:'*',
   methods: ['GET','POST','PUT','DELETE','PATCH','OPTIONS'],
   credentials: true
 }));
@@ -24,94 +26,74 @@ const pool = new Pool({
 async function migrate() {
   await pool.query(`
     CREATE TABLE IF NOT EXISTS floors (
-      id         SERIAL PRIMARY KEY,
-      name       VARCHAR(100) NOT NULL,
-      sort_order INTEGER NOT NULL DEFAULT 0,
-      created_at TIMESTAMP DEFAULT NOW()
+      id SERIAL PRIMARY KEY, name VARCHAR(100) NOT NULL,
+      sort_order INTEGER NOT NULL DEFAULT 0, created_at TIMESTAMP DEFAULT NOW()
     );
     CREATE TABLE IF NOT EXISTS grocery_items (
-      id         SERIAL PRIMARY KEY,
-      name       VARCHAR(100) NOT NULL UNIQUE,
-      unit       VARCHAR(20) NOT NULL,
-      category   VARCHAR(50),
-      created_at TIMESTAMP DEFAULT NOW()
+      id SERIAL PRIMARY KEY, name VARCHAR(100) NOT NULL UNIQUE,
+      unit VARCHAR(20) NOT NULL, category VARCHAR(50), created_at TIMESTAMP DEFAULT NOW()
     );
     CREATE TABLE IF NOT EXISTS grocery_purchases (
-      id         SERIAL PRIMARY KEY,
-      item_id    INTEGER NOT NULL REFERENCES grocery_items(id) ON DELETE CASCADE,
-      month      SMALLINT NOT NULL CHECK (month BETWEEN 1 AND 12),
-      year       SMALLINT NOT NULL,
-      qty        DECIMAL(10,2) NOT NULL,
-      price      DECIMAL(10,2) DEFAULT 0,
-      vendor     VARCHAR(100),
-      date       DATE,
-      notes      TEXT,
-      added_by   VARCHAR(200),
-      bill_url   TEXT,
+      id SERIAL PRIMARY KEY,
+      item_id INTEGER NOT NULL REFERENCES grocery_items(id) ON DELETE CASCADE,
+      month SMALLINT NOT NULL CHECK (month BETWEEN 1 AND 12),
+      year SMALLINT NOT NULL,
+      qty DECIMAL(10,2) NOT NULL CHECK (qty >= 0),
+      price DECIMAL(10,2) DEFAULT 0,
+      vendor VARCHAR(100), date DATE, notes TEXT,
+      added_by VARCHAR(200), bill_url TEXT,
+      opening_stock DECIMAL(10,2) DEFAULT 0,
       created_at TIMESTAMP DEFAULT NOW(),
       UNIQUE (item_id, month, year)
     );
     CREATE TABLE IF NOT EXISTS floor_distributions (
-      id          SERIAL PRIMARY KEY,
+      id SERIAL PRIMARY KEY,
       purchase_id INTEGER NOT NULL REFERENCES grocery_purchases(id) ON DELETE CASCADE,
-      floor_id    INTEGER NOT NULL REFERENCES floors(id) ON DELETE CASCADE,
-      qty         DECIMAL(10,2) NOT NULL DEFAULT 0,
+      floor_id INTEGER NOT NULL REFERENCES floors(id) ON DELETE CASCADE,
+      qty DECIMAL(10,2) NOT NULL DEFAULT 0 CHECK (qty >= 0),
+      UNIQUE (purchase_id, floor_id)
+    );
+    CREATE TABLE IF NOT EXISTS floor_usage (
+      id SERIAL PRIMARY KEY,
+      purchase_id INTEGER NOT NULL REFERENCES grocery_purchases(id) ON DELETE CASCADE,
+      floor_id INTEGER NOT NULL REFERENCES floors(id) ON DELETE CASCADE,
+      closing_stock DECIMAL(10,2) NOT NULL DEFAULT 0 CHECK (closing_stock >= 0),
+      recorded_at TIMESTAMP DEFAULT NOW(),
+      recorded_by VARCHAR(200),
       UNIQUE (purchase_id, floor_id)
     );
     CREATE TABLE IF NOT EXISTS spend_categories (
-      id         SERIAL PRIMARY KEY,
-      name       VARCHAR(100) NOT NULL UNIQUE,
-      color      VARCHAR(7) DEFAULT '#6366f1',
-      icon       VARCHAR(20),
-      created_at TIMESTAMP DEFAULT NOW()
+      id SERIAL PRIMARY KEY, name VARCHAR(100) NOT NULL UNIQUE,
+      color VARCHAR(7) DEFAULT '#6366f1', icon VARCHAR(20), created_at TIMESTAMP DEFAULT NOW()
     );
     CREATE TABLE IF NOT EXISTS monthly_budgets (
-      id            SERIAL PRIMARY KEY,
-      category_id   INTEGER NOT NULL REFERENCES spend_categories(id) ON DELETE CASCADE,
-      month         SMALLINT NOT NULL CHECK (month BETWEEN 1 AND 12),
-      year          SMALLINT NOT NULL,
-      budget_amount DECIMAL(12,2) NOT NULL,
-      notes         TEXT,
-      created_at    TIMESTAMP DEFAULT NOW(),
-      UNIQUE (category_id, month, year)
+      id SERIAL PRIMARY KEY,
+      category_id INTEGER NOT NULL REFERENCES spend_categories(id) ON DELETE CASCADE,
+      month SMALLINT NOT NULL CHECK (month BETWEEN 1 AND 12),
+      year SMALLINT NOT NULL, budget_amount DECIMAL(12,2) NOT NULL, notes TEXT,
+      created_at TIMESTAMP DEFAULT NOW(), UNIQUE (category_id, month, year)
     );
     CREATE TABLE IF NOT EXISTS spend_entries (
-      id           SERIAL PRIMARY KEY,
-      category_id  INTEGER REFERENCES spend_categories(id) ON DELETE SET NULL,
-      spend_date   DATE NOT NULL,
-      amount       DECIMAL(12,2) NOT NULL,
-      purpose      TEXT NOT NULL,
-      payment_mode VARCHAR(30) DEFAULT 'cash',
-      vendor       VARCHAR(100),
-      invoice_ref  VARCHAR(100),
-      approved_by  VARCHAR(100),
-      notes        TEXT,
-      added_by     VARCHAR(200),
-      bill_url     TEXT,
-      created_at   TIMESTAMP DEFAULT NOW()
+      id SERIAL PRIMARY KEY,
+      category_id INTEGER REFERENCES spend_categories(id) ON DELETE SET NULL,
+      spend_date DATE NOT NULL, amount DECIMAL(12,2) NOT NULL CHECK (amount >= 0),
+      purpose TEXT NOT NULL, payment_mode VARCHAR(30) DEFAULT 'cash',
+      vendor VARCHAR(100), invoice_ref VARCHAR(100), approved_by VARCHAR(100),
+      notes TEXT, added_by VARCHAR(200), bill_url TEXT, created_at TIMESTAMP DEFAULT NOW()
     );
     CREATE TABLE IF NOT EXISTS grocery_categories (
-      id         SERIAL PRIMARY KEY,
-      name       VARCHAR(100) NOT NULL UNIQUE,
-      created_at TIMESTAMP DEFAULT NOW()
+      id SERIAL PRIMARY KEY, name VARCHAR(100) NOT NULL UNIQUE, created_at TIMESTAMP DEFAULT NOW()
     );
   `);
 
-  /* add new columns to existing tables if not present (safe for existing deployments) */
+  /* safe column additions for existing deployments */
   await pool.query(`
     DO $$ BEGIN
-      IF NOT EXISTS (SELECT 1 FROM information_schema.columns WHERE table_name='grocery_purchases' AND column_name='added_by') THEN
-        ALTER TABLE grocery_purchases ADD COLUMN added_by VARCHAR(200);
-      END IF;
-      IF NOT EXISTS (SELECT 1 FROM information_schema.columns WHERE table_name='grocery_purchases' AND column_name='bill_url') THEN
-        ALTER TABLE grocery_purchases ADD COLUMN bill_url TEXT;
-      END IF;
-      IF NOT EXISTS (SELECT 1 FROM information_schema.columns WHERE table_name='spend_entries' AND column_name='added_by') THEN
-        ALTER TABLE spend_entries ADD COLUMN added_by VARCHAR(200);
-      END IF;
-      IF NOT EXISTS (SELECT 1 FROM information_schema.columns WHERE table_name='spend_entries' AND column_name='bill_url') THEN
-        ALTER TABLE spend_entries ADD COLUMN bill_url TEXT;
-      END IF;
+      IF NOT EXISTS (SELECT 1 FROM information_schema.columns WHERE table_name='grocery_purchases' AND column_name='added_by') THEN ALTER TABLE grocery_purchases ADD COLUMN added_by VARCHAR(200); END IF;
+      IF NOT EXISTS (SELECT 1 FROM information_schema.columns WHERE table_name='grocery_purchases' AND column_name='bill_url') THEN ALTER TABLE grocery_purchases ADD COLUMN bill_url TEXT; END IF;
+      IF NOT EXISTS (SELECT 1 FROM information_schema.columns WHERE table_name='grocery_purchases' AND column_name='opening_stock') THEN ALTER TABLE grocery_purchases ADD COLUMN opening_stock DECIMAL(10,2) DEFAULT 0; END IF;
+      IF NOT EXISTS (SELECT 1 FROM information_schema.columns WHERE table_name='spend_entries' AND column_name='added_by') THEN ALTER TABLE spend_entries ADD COLUMN added_by VARCHAR(200); END IF;
+      IF NOT EXISTS (SELECT 1 FROM information_schema.columns WHERE table_name='spend_entries' AND column_name='bill_url') THEN ALTER TABLE spend_entries ADD COLUMN bill_url TEXT; END IF;
     END $$;
   `);
 
@@ -167,16 +149,12 @@ app.get('/api/grocery/categories', async (req, res) => {
   catch (e) { res.status(500).json({ error:e.message }); }
 });
 app.post('/api/grocery/categories', async (req, res) => {
-  try {
-    const r = await pool.query('INSERT INTO grocery_categories (name) VALUES ($1) ON CONFLICT (name) DO NOTHING RETURNING *', [req.body.name.trim().toLowerCase()]);
-    res.json(r.rows[0]);
-  } catch (e) { res.status(500).json({ error:e.message }); }
+  try { const r = await pool.query('INSERT INTO grocery_categories (name) VALUES ($1) ON CONFLICT (name) DO NOTHING RETURNING *', [req.body.name.trim().toLowerCase()]); res.json(r.rows[0]); }
+  catch (e) { res.status(500).json({ error:e.message }); }
 });
 app.put('/api/grocery/categories/:id', async (req, res) => {
-  try {
-    const r = await pool.query('UPDATE grocery_categories SET name=$1 WHERE id=$2 RETURNING *', [req.body.name.trim().toLowerCase(), req.params.id]);
-    res.json(r.rows[0]);
-  } catch (e) { res.status(500).json({ error:e.message }); }
+  try { const r = await pool.query('UPDATE grocery_categories SET name=$1 WHERE id=$2 RETURNING *', [req.body.name.trim().toLowerCase(), req.params.id]); res.json(r.rows[0]); }
+  catch (e) { res.status(500).json({ error:e.message }); }
 });
 app.delete('/api/grocery/categories/:id', async (req, res) => {
   try { await pool.query('DELETE FROM grocery_categories WHERE id=$1', [req.params.id]); res.json({ success:true }); }
@@ -190,17 +168,13 @@ app.get('/api/grocery/items', async (req, res) => {
 });
 app.post('/api/grocery/items', async (req, res) => {
   const { name, unit, category } = req.body;
-  try {
-    const r = await pool.query('INSERT INTO grocery_items (name,unit,category) VALUES ($1,$2,$3) ON CONFLICT (name) DO UPDATE SET unit=EXCLUDED.unit,category=EXCLUDED.category RETURNING *', [name,unit,category]);
-    res.json(r.rows[0]);
-  } catch (e) { res.status(500).json({ error:e.message }); }
+  try { const r = await pool.query('INSERT INTO grocery_items (name,unit,category) VALUES ($1,$2,$3) ON CONFLICT (name) DO UPDATE SET unit=EXCLUDED.unit,category=EXCLUDED.category RETURNING *', [name,unit,category]); res.json(r.rows[0]); }
+  catch (e) { res.status(500).json({ error:e.message }); }
 });
 app.put('/api/grocery/items/:id', async (req, res) => {
   const { name, unit, category } = req.body;
-  try {
-    const r = await pool.query('UPDATE grocery_items SET name=$1,unit=$2,category=$3 WHERE id=$4 RETURNING *', [name,unit,category,req.params.id]);
-    res.json(r.rows[0]);
-  } catch (e) { res.status(500).json({ error:e.message }); }
+  try { const r = await pool.query('UPDATE grocery_items SET name=$1,unit=$2,category=$3 WHERE id=$4 RETURNING *', [name,unit,category,req.params.id]); res.json(r.rows[0]); }
+  catch (e) { res.status(500).json({ error:e.message }); }
 });
 app.delete('/api/grocery/items/:id', async (req, res) => {
   try { await pool.query('DELETE FROM grocery_items WHERE id=$1', [req.params.id]); res.json({ success:true }); }
@@ -213,14 +187,22 @@ app.get('/api/grocery/purchases', async (req, res) => {
   try {
     let q = `
       SELECT gp.id, gi.name AS item_name, gi.unit, gi.category,
-        gp.item_id, gp.month, gp.year, gp.qty, gp.price,
+        gp.item_id, gp.month, gp.year, gp.qty, gp.price, gp.opening_stock,
         ROUND(gp.qty * gp.price, 2) AS total_cost,
         gp.vendor, gp.date, gp.notes, gp.added_by, gp.bill_url, gp.created_at,
         COALESCE((SELECT SUM(fd.qty) FROM floor_distributions fd WHERE fd.purchase_id=gp.id),0) AS total_dist,
-        gp.qty - COALESCE((SELECT SUM(fd.qty) FROM floor_distributions fd WHERE fd.purchase_id=gp.id),0) AS remaining,
+        gp.qty + COALESCE(gp.opening_stock,0) - COALESCE((SELECT SUM(fd.qty) FROM floor_distributions fd WHERE fd.purchase_id=gp.id),0) AS remaining,
         COALESCE((
-          SELECT json_agg(json_build_object('floor_id',fd.floor_id,'floor_name',f.name,'qty',fd.qty) ORDER BY f.sort_order)
-          FROM floor_distributions fd JOIN floors f ON f.id=fd.floor_id WHERE fd.purchase_id=gp.id
+          SELECT json_agg(json_build_object(
+            'floor_id',fd.floor_id,'floor_name',f.name,'qty',fd.qty,
+            'closing_stock',COALESCE(fu.closing_stock,NULL),
+            'used',CASE WHEN fu.closing_stock IS NOT NULL THEN GREATEST(0, fd.qty - fu.closing_stock) ELSE NULL END,
+            'recorded_by',fu.recorded_by,'recorded_at',fu.recorded_at
+          ) ORDER BY f.sort_order)
+          FROM floor_distributions fd
+          JOIN floors f ON f.id=fd.floor_id
+          LEFT JOIN floor_usage fu ON fu.purchase_id=gp.id AND fu.floor_id=fd.floor_id
+          WHERE fd.purchase_id=gp.id
         ),'[]'::json) AS floor_breakdown
       FROM grocery_purchases gp JOIN grocery_items gi ON gi.id=gp.item_id WHERE 1=1`;
     const params = [];
@@ -232,18 +214,35 @@ app.get('/api/grocery/purchases', async (req, res) => {
 });
 
 app.post('/api/grocery/purchases', async (req, res) => {
-  const { item_id, month, year, qty, price, vendor, date, notes, added_by, floors=[] } = req.body;
+  const { item_id, month, year, qty, price, vendor, date, notes, added_by, opening_stock=0, floors=[] } = req.body;
+
+  /* validation: no negative qty */
+  if (Number(qty) < 0) return res.status(400).json({ error: 'Quantity cannot be negative' });
+
+  /* validation: total assigned <= qty + opening_stock */
+  const totalAssigned = floors.reduce((s,f) => s + Number(f.qty||0), 0);
+  const totalAvailable = Number(qty) + Number(opening_stock||0);
+  if (totalAssigned > totalAvailable) {
+    return res.status(400).json({ error: `Total assigned (${totalAssigned}) cannot exceed total available stock (${totalAvailable})` });
+  }
+
+  /* validation: no negative floor qty */
+  for (const f of floors) {
+    if (Number(f.qty) < 0) return res.status(400).json({ error: 'Floor quantity cannot be negative' });
+  }
+
   const client = await pool.connect();
   try {
     await client.query('BEGIN');
     const r = await client.query(`
-      INSERT INTO grocery_purchases (item_id,month,year,qty,price,vendor,date,notes,added_by)
-      VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9)
+      INSERT INTO grocery_purchases (item_id,month,year,qty,price,vendor,date,notes,added_by,opening_stock)
+      VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10)
       ON CONFLICT (item_id,month,year) DO UPDATE SET
-        qty=EXCLUDED.qty,price=EXCLUDED.price,vendor=EXCLUDED.vendor,
-        date=EXCLUDED.date,notes=EXCLUDED.notes,added_by=EXCLUDED.added_by
+        qty=EXCLUDED.qty, price=EXCLUDED.price, vendor=EXCLUDED.vendor,
+        date=EXCLUDED.date, notes=EXCLUDED.notes, added_by=EXCLUDED.added_by,
+        opening_stock=EXCLUDED.opening_stock
       RETURNING *`,
-      [item_id,month,year,qty,price||0,vendor,date,notes,added_by||null]
+      [item_id,month,year,qty,price||0,vendor,date,notes,added_by||null,opening_stock||0]
     );
     const pid = r.rows[0].id;
     await client.query('DELETE FROM floor_distributions WHERE purchase_id=$1', [pid]);
@@ -257,10 +256,8 @@ app.post('/api/grocery/purchases', async (req, res) => {
 });
 
 app.patch('/api/grocery/purchases/:id/bill', async (req, res) => {
-  try {
-    const r = await pool.query('UPDATE grocery_purchases SET bill_url=$1 WHERE id=$2 RETURNING *', [req.body.bill_url, req.params.id]);
-    res.json(r.rows[0]);
-  } catch (e) { res.status(500).json({ error:e.message }); }
+  try { const r = await pool.query('UPDATE grocery_purchases SET bill_url=$1 WHERE id=$2 RETURNING *', [req.body.bill_url, req.params.id]); res.json(r.rows[0]); }
+  catch (e) { res.status(500).json({ error:e.message }); }
 });
 
 app.delete('/api/grocery/purchases/:id', async (req, res) => {
@@ -268,22 +265,84 @@ app.delete('/api/grocery/purchases/:id', async (req, res) => {
   catch (e) { res.status(500).json({ error:e.message }); }
 });
 
+/* ── FLOOR USAGE (month-end stock count) ── */
+/* POST body: { entries: [{floor_id, closing_stock, recorded_by}] } */
+app.post('/api/grocery/purchases/:id/usage', async (req, res) => {
+  const { entries=[], recorded_by } = req.body;
+  const purchase_id = req.params.id;
+
+  /* get distribution qtys to validate closing <= assigned */
+  const dists = await pool.query('SELECT floor_id, qty FROM floor_distributions WHERE purchase_id=$1', [purchase_id]);
+  const distMap = {};
+  dists.rows.forEach(d => { distMap[d.floor_id] = Number(d.qty); });
+
+  for (const e of entries) {
+    const assigned = distMap[e.floor_id] || 0;
+    if (Number(e.closing_stock) < 0) return res.status(400).json({ error: 'Closing stock cannot be negative' });
+    if (Number(e.closing_stock) > assigned) return res.status(400).json({ error: `Closing stock for a floor cannot exceed assigned quantity (${assigned})` });
+  }
+
+  const client = await pool.connect();
+  try {
+    await client.query('BEGIN');
+    for (const e of entries) {
+      await client.query(`
+        INSERT INTO floor_usage (purchase_id,floor_id,closing_stock,recorded_by)
+        VALUES ($1,$2,$3,$4)
+        ON CONFLICT (purchase_id,floor_id) DO UPDATE SET
+          closing_stock=EXCLUDED.closing_stock, recorded_by=EXCLUDED.recorded_by, recorded_at=NOW()`,
+        [purchase_id, e.floor_id, e.closing_stock, recorded_by||null]
+      );
+    }
+    await client.query('COMMIT');
+    res.json({ success:true });
+  } catch (e) { await client.query('ROLLBACK'); res.status(500).json({ error:e.message }); }
+  finally { client.release(); }
+});
+
+/* ── CARRY FORWARD: unassigned + floor closing stocks from prev month ── */
+app.get('/api/grocery/carryforward', async (req, res) => {
+  const { month, year, item_id } = req.query;
+  let pm = parseInt(month) - 1, py = parseInt(year);
+  if (pm === 0) { pm = 12; py -= 1; }
+  try {
+    const r = await pool.query(`
+      SELECT
+        gp.qty + COALESCE(gp.opening_stock,0)
+          - COALESCE((SELECT SUM(fd.qty) FROM floor_distributions fd WHERE fd.purchase_id=gp.id),0) AS unassigned,
+        COALESCE((SELECT SUM(fu.closing_stock) FROM floor_usage fu WHERE fu.purchase_id=gp.id),0) AS floor_closings
+      FROM grocery_purchases gp
+      WHERE gp.item_id=$1 AND gp.month=$2 AND gp.year=$3`,
+      [item_id, pm, py]
+    );
+    if (!r.rows[0]) return res.json({ carry_forward: 0 });
+    const total = Number(r.rows[0].unassigned) + Number(r.rows[0].floor_closings);
+    res.json({ carry_forward: Math.max(0, total) });
+  } catch (e) { res.status(500).json({ error:e.message }); }
+});
+
 app.get('/api/grocery/stats', async (req, res) => {
   const { month, year } = req.query;
   try {
     const summary = await pool.query(`
       SELECT COUNT(*) AS total_items,
-        COALESCE(SUM(qty*price),0) AS total_cost, COALESCE(SUM(qty),0) AS total_qty,
+        COALESCE(SUM(qty*price),0) AS total_cost,
+        COALESCE(SUM(qty + COALESCE(opening_stock,0)),0) AS total_qty,
         COALESCE((SELECT SUM(fd.qty) FROM floor_distributions fd JOIN grocery_purchases gp ON gp.id=fd.purchase_id WHERE gp.month=$1 AND gp.year=$2),0) AS total_dist,
-        COALESCE(SUM(qty),0) - COALESCE((SELECT SUM(fd.qty) FROM floor_distributions fd JOIN grocery_purchases gp ON gp.id=fd.purchase_id WHERE gp.month=$1 AND gp.year=$2),0) AS total_remaining
+        COALESCE(SUM(qty + COALESCE(opening_stock,0)),0) - COALESCE((SELECT SUM(fd.qty) FROM floor_distributions fd JOIN grocery_purchases gp ON gp.id=fd.purchase_id WHERE gp.month=$1 AND gp.year=$2),0) AS total_remaining
       FROM grocery_purchases WHERE month=$1 AND year=$2`, [month,year]);
+
     const floorStats = await pool.query(`
       SELECT f.id AS floor_id, f.name AS floor_name, f.sort_order,
-        COALESCE(SUM(fd.qty),0) AS total_assigned
+        COALESCE(SUM(fd.qty),0) AS total_assigned,
+        COALESCE(SUM(fu.closing_stock),0) AS total_closing,
+        COALESCE(SUM(CASE WHEN fu.closing_stock IS NOT NULL THEN GREATEST(0, fd.qty - fu.closing_stock) ELSE 0 END),0) AS total_used
       FROM floors f
       LEFT JOIN floor_distributions fd ON fd.floor_id=f.id
       LEFT JOIN grocery_purchases gp ON gp.id=fd.purchase_id AND gp.month=$1 AND gp.year=$2
+      LEFT JOIN floor_usage fu ON fu.floor_id=f.id AND fu.purchase_id=fd.purchase_id
       GROUP BY f.id,f.name,f.sort_order ORDER BY f.sort_order`, [month,year]);
+
     res.json({ summary:summary.rows[0], floorStats:floorStats.rows });
   } catch (e) { res.status(500).json({ error:e.message }); }
 });
@@ -295,17 +354,13 @@ app.get('/api/budget/categories', async (req, res) => {
 });
 app.post('/api/budget/categories', async (req, res) => {
   const { name, color, icon } = req.body;
-  try {
-    const r = await pool.query('INSERT INTO spend_categories (name,color,icon) VALUES ($1,$2,$3) ON CONFLICT (name) DO UPDATE SET color=EXCLUDED.color,icon=EXCLUDED.icon RETURNING *', [name,color||'#6366f1',icon]);
-    res.json(r.rows[0]);
-  } catch (e) { res.status(500).json({ error:e.message }); }
+  try { const r = await pool.query('INSERT INTO spend_categories (name,color,icon) VALUES ($1,$2,$3) ON CONFLICT (name) DO UPDATE SET color=EXCLUDED.color,icon=EXCLUDED.icon RETURNING *', [name,color||'#6366f1',icon]); res.json(r.rows[0]); }
+  catch (e) { res.status(500).json({ error:e.message }); }
 });
 app.put('/api/budget/categories/:id', async (req, res) => {
   const { name, color, icon } = req.body;
-  try {
-    const r = await pool.query('UPDATE spend_categories SET name=$1,color=$2,icon=$3 WHERE id=$4 RETURNING *', [name,color,icon,req.params.id]);
-    res.json(r.rows[0]);
-  } catch (e) { res.status(500).json({ error:e.message }); }
+  try { const r = await pool.query('UPDATE spend_categories SET name=$1,color=$2,icon=$3 WHERE id=$4 RETURNING *', [name,color,icon,req.params.id]); res.json(r.rows[0]); }
+  catch (e) { res.status(500).json({ error:e.message }); }
 });
 app.delete('/api/budget/categories/:id', async (req, res) => {
   try { await pool.query('DELETE FROM spend_categories WHERE id=$1', [req.params.id]); res.json({ success:true }); }
@@ -315,17 +370,13 @@ app.delete('/api/budget/categories/:id', async (req, res) => {
 /* ── MONTHLY BUDGETS ── */
 app.get('/api/budget/monthly', async (req, res) => {
   const { month, year } = req.query;
-  try {
-    const r = await pool.query('SELECT mb.*,sc.name AS category_name,sc.color,sc.icon FROM monthly_budgets mb JOIN spend_categories sc ON sc.id=mb.category_id WHERE mb.month=$1 AND mb.year=$2', [month,year]);
-    res.json(r.rows);
-  } catch (e) { res.status(500).json({ error:e.message }); }
+  try { const r = await pool.query('SELECT mb.*,sc.name AS category_name,sc.color,sc.icon FROM monthly_budgets mb JOIN spend_categories sc ON sc.id=mb.category_id WHERE mb.month=$1 AND mb.year=$2', [month,year]); res.json(r.rows); }
+  catch (e) { res.status(500).json({ error:e.message }); }
 });
 app.post('/api/budget/monthly', async (req, res) => {
   const { category_id, month, year, budget_amount, notes } = req.body;
-  try {
-    const r = await pool.query('INSERT INTO monthly_budgets (category_id,month,year,budget_amount,notes) VALUES ($1,$2,$3,$4,$5) ON CONFLICT (category_id,month,year) DO UPDATE SET budget_amount=EXCLUDED.budget_amount,notes=EXCLUDED.notes RETURNING *', [category_id,month,year,budget_amount,notes]);
-    res.json(r.rows[0]);
-  } catch (e) { res.status(500).json({ error:e.message }); }
+  try { const r = await pool.query('INSERT INTO monthly_budgets (category_id,month,year,budget_amount,notes) VALUES ($1,$2,$3,$4,$5) ON CONFLICT (category_id,month,year) DO UPDATE SET budget_amount=EXCLUDED.budget_amount,notes=EXCLUDED.notes RETURNING *', [category_id,month,year,budget_amount,notes]); res.json(r.rows[0]); }
+  catch (e) { res.status(500).json({ error:e.message }); }
 });
 app.delete('/api/budget/monthly/:id', async (req, res) => {
   try { await pool.query('DELETE FROM monthly_budgets WHERE id=$1', [req.params.id]); res.json({ success:true }); }
@@ -341,28 +392,24 @@ app.get('/api/budget/spends', async (req, res) => {
     if (category_id) { params.push(category_id); q += ` AND se.category_id=$${params.length}`; }
     q += ' ORDER BY se.spend_date DESC, se.id DESC';
     const rows = (await pool.query(q, params)).rows;
-    res.json(rows.map(s => ({ ...s, date:s.spend_date, amt:s.amount, cat:s.category_id, mode:s.payment_mode, approved:s.approved_by, added_by:s.added_by, bill_url:s.bill_url })));
+    res.json(rows.map(s => ({ ...s, date:s.spend_date, amt:s.amount, cat:s.category_id, mode:s.payment_mode, approved:s.approved_by })));
   } catch (e) { res.status(500).json({ error:e.message }); }
 });
 app.post('/api/budget/spends', async (req, res) => {
   const { cat, date, amt, purpose, mode, vendor, invoice, approved, notes, added_by } = req.body;
-  try {
-    const r = await pool.query('INSERT INTO spend_entries (category_id,spend_date,amount,purpose,payment_mode,vendor,invoice_ref,approved_by,notes,added_by) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10) RETURNING *', [cat||null,date,amt,purpose,mode||'cash',vendor,invoice,approved,notes,added_by||null]);
-    res.json(r.rows[0]);
-  } catch (e) { res.status(500).json({ error:e.message }); }
+  if (Number(amt) < 0) return res.status(400).json({ error: 'Amount cannot be negative' });
+  try { const r = await pool.query('INSERT INTO spend_entries (category_id,spend_date,amount,purpose,payment_mode,vendor,invoice_ref,approved_by,notes,added_by) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10) RETURNING *', [cat||null,date,amt,purpose,mode||'cash',vendor,invoice,approved,notes,added_by||null]); res.json(r.rows[0]); }
+  catch (e) { res.status(500).json({ error:e.message }); }
 });
 app.put('/api/budget/spends/:id', async (req, res) => {
   const { cat, date, amt, purpose, mode, vendor, invoice, approved, notes } = req.body;
-  try {
-    const r = await pool.query('UPDATE spend_entries SET category_id=$1,spend_date=$2,amount=$3,purpose=$4,payment_mode=$5,vendor=$6,invoice_ref=$7,approved_by=$8,notes=$9 WHERE id=$10 RETURNING *', [cat||null,date,amt,purpose,mode||'cash',vendor,invoice,approved,notes,req.params.id]);
-    res.json(r.rows[0]);
-  } catch (e) { res.status(500).json({ error:e.message }); }
+  if (Number(amt) < 0) return res.status(400).json({ error: 'Amount cannot be negative' });
+  try { const r = await pool.query('UPDATE spend_entries SET category_id=$1,spend_date=$2,amount=$3,purpose=$4,payment_mode=$5,vendor=$6,invoice_ref=$7,approved_by=$8,notes=$9 WHERE id=$10 RETURNING *', [cat||null,date,amt,purpose,mode||'cash',vendor,invoice,approved,notes,req.params.id]); res.json(r.rows[0]); }
+  catch (e) { res.status(500).json({ error:e.message }); }
 });
 app.patch('/api/budget/spends/:id/bill', async (req, res) => {
-  try {
-    const r = await pool.query('UPDATE spend_entries SET bill_url=$1 WHERE id=$2 RETURNING *', [req.body.bill_url, req.params.id]);
-    res.json(r.rows[0]);
-  } catch (e) { res.status(500).json({ error:e.message }); }
+  try { const r = await pool.query('UPDATE spend_entries SET bill_url=$1 WHERE id=$2 RETURNING *', [req.body.bill_url, req.params.id]); res.json(r.rows[0]); }
+  catch (e) { res.status(500).json({ error:e.message }); }
 });
 app.delete('/api/budget/spends/:id', async (req, res) => {
   try { await pool.query('DELETE FROM spend_entries WHERE id=$1', [req.params.id]); res.json({ success:true }); }
@@ -382,7 +429,7 @@ app.get('/api/budget/stats', async (req, res) => {
 
 const PORT = process.env.PORT || 3001;
 migrate().then(() => {
-  app.listen(PORT, () => console.log(`\n✅  Office Admin API → https://office-admin-portal-backend-f0w9.onrender.com/api/health\n`));
+  app.listen(PORT, () => console.log(`\n✅  Office Admin API → https://office-admin-portal-f0w9.onrender.com/api/health\n`));
 }).catch(e => { console.error('Migration failed:', e); process.exit(1); });
 
 module.exports = app;
